@@ -16,21 +16,49 @@ payload="$(cat <&0)"
 load_pubkey "$payload"
 configure_https_tunnel "$payload"
 configure_git_ssl_verification "$payload"
-configure_credentials "$payload"
 
-uri=$(jq -r '.source.uri // ""' <<< "$payload")
-branch=$(jq -r '.source.branch // ""' <<< "$payload")
-paths="$(jq -r '(.source.paths // ["."])[]' <<< "$payload")" # those "'s are important
-ignore_paths="$(jq -r '":!" + (.source.ignore_paths // [])[]' <<< "$payload")" # these ones too
-tag_filter=$(jq -r '.source.tag_filter // ""' <<< "$payload")
-tag_regex=$(jq -r '.source.tag_regex // ""' <<< "$payload")
-git_config_payload=$(jq -r '.source.git_config // []' <<< "$payload")
-ref=$(jq -r '.version.ref // ""' <<< "$payload")
-skip_ci_disabled=$(jq -r '.source.disable_ci_skip // false' <<< "$payload")
-filter_include=$(jq '.source.commit_filter.include // []' <<< "$payload")
-filter_exclude=$(jq '.source.commit_filter.exclude // []' <<< "$payload")
-version_depth=$(jq -r '.source.version_depth // 1' <<< "$payload")
+uri=$(jq -r '.source.uri // ""' <<<"$payload")
+branch=$(jq -r '.source.branch // ""' <<<"$payload")
+paths="$(jq -r '(.source.paths // ["."])[]' <<<"$payload")"                   # those "'s are important
+ignore_paths="$(jq -r '":!" + (.source.ignore_paths // [])[]' <<<"$payload")" # these ones too
+tag_filter=$(jq -r '.source.tag_filter // ""' <<<"$payload")
+tag_regex=$(jq -r '.source.tag_regex // ""' <<<"$payload")
+git_config_payload=$(jq -r '.source.git_config // []' <<<"$payload")
+ref=$(jq -r '.version.ref // ""' <<<"$payload")
+skip_ci_disabled=$(jq -r '.source.disable_ci_skip // false' <<<"$payload")
+filter_include=$(jq '.source.commit_filter.include // []' <<<"$payload")
+filter_exclude=$(jq '.source.commit_filter.exclude // []' <<<"$payload")
+version_depth=$(jq -r '.source.version_depth // 1' <<<"$payload")
+github_app_account=$(jq -r '.source.github_app_account // ""' <<<"$payload")
+github_app_id=$(jq -r '.source.github_app_id // ""' <<<"$payload")
+github_app_private_key=$(jq -r '.source.github_app_private_key // ""' <<<"$payload")
+github_app_token_duration_mins=$(jq -r '.source.github_app_token_duration // "3"' <<<"$payload")
 reverse=false
+
+# Github App configuration
+if [ -n "${github_app_account}" ] && [ -n "${github_app_id}" ] && [ -n "${github_app_private_key}" ]; then
+  echo "${github_app_private_key}" >gha_privatekey.pem
+  gha_jwt_token=$(jwt encode --alg RS256 --secret @gha_privatekey.pem --iss "${github_app_id}" --exp "+${github_app_token_duration_mins}min")
+  rm -f gha_privatekey.pem
+  gha_installation_id=$(curl -s -X GET -H "Authorization: Bearer ${gha_jwt_token}" -H "Accept: application/vnd.github+json" https://api.github.com/app/installations |
+    jq -r --arg target "${github_app_account}" 'map(select(.account.login==$target)) | .[0].id // ""')
+  if [ -z "${gha_installation_id}" ]; then
+    echo "failed to get your Github App installation id. Check your Github App configuration of this resource or on GitHub." >&2
+    exit 1
+  fi
+  github_app_token=$(curl -s -X POST -H "Authorization: Bearer ${gha_jwt_token}" -H "Accept: application/vnd.github.v3+json" "https://api.github.com/app/installations/${gha_installation_id}/access_tokens" | jq -r '.token')
+  if [ -z "${github_app_token}" ]; then
+    echo "failed to get Github App token" >&2
+    exit 1
+  fi
+  if ! [[ $uri =~ ^https://github\.com ]]; then
+    echo "Github repository address must begin https:// when using Github App authentication" >&2
+    exit 1
+  fi
+  configure_credentials "$(jq -nr --arg token "${github_app_token}" '{ "source": { "username": "x-username-access", "password": $token } }')"
+else
+  configure_credentials "$payload"
+fi
 
 configure_git_global "${git_config_payload}"
 
@@ -38,15 +66,14 @@ destination=$TMPDIR/git-resource-repo-cache
 
 # Optimization when last commit only is checked and skip ci is disabled
 # Get the commit id with git ls-remote instead of downloading the whole repo
-if [ "$skip_ci_disabled" = "true" ] && \
-   [ "$version_depth" = "1" ] && \
-   [ "$paths" = "." ] && \
-   [ -z "$ignore_paths" ] && \
-   [ -z "$tag_filter" ] && \
-   [ -z "$tag_regex" ] && \
-   jq -e 'length == 0' <<<"$filter_include" && \
-   jq -e 'length == 0' <<<"$filter_exclude"
-then
+if [ "$skip_ci_disabled" = "true" ] &&
+  [ "$version_depth" = "1" ] &&
+  [ "$paths" = "." ] &&
+  [ -z "$ignore_paths" ] &&
+  [ -z "$tag_filter" ] &&
+  [ -z "$tag_regex" ] &&
+  jq -e 'length == 0' <<<"$filter_include" &&
+  jq -e 'length == 0' <<<"$filter_exclude"; then
   branchflag="HEAD"
   if [ -n "$branch" ]; then
     branchflag="$branch"
@@ -63,16 +90,14 @@ then
 fi
 
 tagflag=""
-if [ -n "$tag_filter" ] || [ -n "$tag_regex" ] ; then
+if [ -n "$tag_filter" ] || [ -n "$tag_regex" ]; then
   tagflag="--tags"
 else
   tagflag="--no-tags"
 fi
 
-for filter in "$filter_include" "$filter_exclude"
-do
-  if jq -e 'type != "array"' <<<"$filter"
-  then
+for filter in "$filter_include" "$filter_exclude"; do
+  if jq -e 'type != "array"' <<<"$filter"; then
     echo 'invalid commit filter (expected array of strings)'
     echo "$filter"
     exit 1
@@ -117,37 +142,32 @@ fi
 if [ "$paths" = "." ] && [ -z "$ignore_paths" ]; then
   paths_search=""
 else
-  paths_search=`echo "-- $paths $ignore_paths" | tr "\n\r" " "`
+  paths_search=$(echo "-- $paths $ignore_paths" | tr "\n\r" " ")
 fi
 
 list_command="git rev-list --all --first-parent $log_range $paths_search"
-if jq -e 'length > 0' <<<"$filter_include"
-then
-    list_command+=" | git rev-list --stdin --date-order  --first-parent --no-walk=unsorted "
-    whitelist_items=$(echo $filter_include | jq -r -c '.[]')
-    for wli in "$whitelist_items"
-    do
-        list_command+=" --grep=\"$wli\""
-    done
+if jq -e 'length > 0' <<<"$filter_include"; then
+  list_command+=" | git rev-list --stdin --date-order  --first-parent --no-walk=unsorted "
+  whitelist_items=$(echo $filter_include | jq -r -c '.[]')
+  for wli in "$whitelist_items"; do
+    list_command+=" --grep=\"$wli\""
+  done
 fi
 
-if jq -e 'length > 0' <<<"$filter_exclude"
-then
-    list_command+=" | git rev-list --stdin --date-order  --invert-grep --first-parent --no-walk=unsorted "
-    blacklist_items=$(echo $filter_exclude | jq -r -c '.[]')
-    for bli in "$blacklist_items"
-    do
-        list_command+=" --grep=\"$bli\""
-    done
+if jq -e 'length > 0' <<<"$filter_exclude"; then
+  list_command+=" | git rev-list --stdin --date-order  --invert-grep --first-parent --no-walk=unsorted "
+  blacklist_items=$(echo $filter_exclude | jq -r -c '.[]')
+  for bli in "$blacklist_items"; do
+    list_command+=" --grep=\"$bli\""
+  done
 fi
-
 
 if [ "$skip_ci_disabled" != "true" ]; then
   list_command+=" | git rev-list --stdin --date-order  --grep=\"\\[ci\\sskip\\]\" --grep=\"\\[skip\\sci\\]\" --invert-grep --first-parent --no-walk=unsorted"
 fi
 
 replace_escape_chars() {
-  sed -e 's/[]\/$*.^[]/\\&/g' <<< $1
+  sed -e 's/[]\/$*.^[]/\\&/g' <<<$1
 }
 
 lines_including_and_after() {
@@ -155,7 +175,7 @@ lines_including_and_after() {
   sed -ne "/$escaped_string/,$ p"
 }
 
-get_commit(){
+get_commit() {
   for tag in $*; do
     commit=$(git rev-list -n 1 $tag)
     jq -n '{ref: $tag, commit: $commit}' --arg tag $tag --arg commit $commit
@@ -163,14 +183,12 @@ get_commit(){
 }
 
 #if no range is selected just grab the last commit that fits the filter
-if [ -z "$log_range" ]
-then
-    list_command+="| git rev-list --stdin --date-order --no-walk=unsorted -$version_depth --reverse"
+if [ -z "$log_range" ]; then
+  list_command+="| git rev-list --stdin --date-order --no-walk=unsorted -$version_depth --reverse"
 fi
 
-if [ "$reverse" == "true" ]
-then
-    list_command+="| git rev-list --stdin --date-order  --first-parent --no-walk=unsorted --reverse"
+if [ "$reverse" == "true" ]; then
+  list_command+="| git rev-list --stdin --date-order  --first-parent --no-walk=unsorted --reverse"
 fi
 
 if [ -n "$tag_filter" ]; then

@@ -23,24 +23,52 @@ payload="$(cat <&0)"
 load_pubkey "$payload"
 configure_https_tunnel "$payload"
 configure_git_ssl_verification "$payload"
-configure_credentials "$payload"
 
-uri=$(jq -r '.source.uri // ""' <<< "$payload")
-branch=$(jq -r '.source.branch // ""' <<< "$payload")
-git_config_payload=$(jq -r '.source.git_config // []' <<< "$payload")
-repository=$(jq -r '.params.repository // ""' <<< "$payload")
-tag=$(jq -r '.params.tag // ""' <<< "$payload")
-tag_prefix=$(jq -r '.params.tag_prefix // ""' <<< "$payload")
-rebase=$(jq -r '.params.rebase // false' <<< "$payload")
-merge=$(jq -r '.params.merge // false' <<< "$payload")
-returning=$(jq -r '.params.returning // "merged"' <<< "$payload")
-force=$(jq -r '.params.force // false' <<< "$payload")
-only_tag=$(jq -r '.params.only_tag // false' <<< "$payload")
-annotation_file=$(jq -r '.params.annotate // ""' <<< "$payload")
-notes_file=$(jq -r '.params.notes // ""' <<< "$payload")
-override_branch=$(jq -r '.params.branch // ""' <<< "$payload")
+uri=$(jq -r '.source.uri // ""' <<<"$payload")
+branch=$(jq -r '.source.branch // ""' <<<"$payload")
+git_config_payload=$(jq -r '.source.git_config // []' <<<"$payload")
+repository=$(jq -r '.params.repository // ""' <<<"$payload")
+tag=$(jq -r '.params.tag // ""' <<<"$payload")
+tag_prefix=$(jq -r '.params.tag_prefix // ""' <<<"$payload")
+rebase=$(jq -r '.params.rebase // false' <<<"$payload")
+merge=$(jq -r '.params.merge // false' <<<"$payload")
+returning=$(jq -r '.params.returning // "merged"' <<<"$payload")
+force=$(jq -r '.params.force // false' <<<"$payload")
+only_tag=$(jq -r '.params.only_tag // false' <<<"$payload")
+annotation_file=$(jq -r '.params.annotate // ""' <<<"$payload")
+notes_file=$(jq -r '.params.notes // ""' <<<"$payload")
+override_branch=$(jq -r '.params.branch // ""' <<<"$payload")
 # useful for pushing to special ref types like refs/for in gerrit.
-refs_prefix=$(jq -r '.params.refs_prefix // "refs/heads"' <<< "$payload")
+refs_prefix=$(jq -r '.params.refs_prefix // "refs/heads"' <<<"$payload")
+github_app_account=$(jq -r '.source.github_app_account // ""' <<<"$payload")
+github_app_id=$(jq -r '.source.github_app_id // ""' <<<"$payload")
+github_app_private_key=$(jq -r '.source.github_app_private_key // ""' <<<"$payload")
+github_app_token_duration_mins=$(jq -r '.source.github_app_token_duration // "3"' <<<"$payload")
+
+# Github App configuration
+if [ -n "${github_app_account}" ] && [ -n "${github_app_id}" ] && [ -n "${github_app_private_key}" ]; then
+  echo "${github_app_private_key}" >gha_privatekey.pem
+  gha_jwt_token=$(jwt encode --alg RS256 --secret @gha_privatekey.pem --iss "${github_app_id}" --exp "+${github_app_token_duration_mins}min")
+  rm -f gha_privatekey.pem
+  gha_installation_id=$(curl -s -X GET -H "Authorization: Bearer ${gha_jwt_token}" -H "Accept: application/vnd.github+json" https://api.github.com/app/installations |
+    jq -r --arg target "${github_app_account}" 'map(select(.account.login==$target)) | .[0].id // ""')
+  if [ -z "${gha_installation_id}" ]; then
+    echo "failed to get your Github App installation id. Check your Github App configuration of this resource or on GitHub." >&2
+    exit 1
+  fi
+  github_app_token=$(curl -s -X POST -H "Authorization: Bearer ${gha_jwt_token}" -H "Accept: application/vnd.github.v3+json" "https://api.github.com/app/installations/${gha_installation_id}/access_tokens" | jq -r '.token')
+  if [ -z "${github_app_token}" ]; then
+    echo "failed to get Github App token" >&2
+    exit 1
+  fi
+  if ! [[ $uri =~ ^https://github\.com ]]; then
+    echo "Github repository address must begin https:// when using Github App authentication" >&2
+    exit 1
+  fi
+  configure_credentials "$(jq -nr --arg token "${github_app_token}" '{ "source": { "username": "x-username-access", "password": $token } }')"
+else
+  configure_credentials "$payload"
+fi
 
 configure_git_global "${git_config_payload}"
 
@@ -123,11 +151,11 @@ push_with_result_check() {
   # oh god this is really the only way to do this
   result_file=$(mktemp $TMPDIR/git-result.XXXXXX)
 
-  echo 0 > $result_file
+  echo 0 >$result_file
 
   {
     tag 2>&1 && push_src_and_tags 2>&1 && add_and_push_notes 2>&1 || {
-      echo $? > $result_file
+      echo $? >$result_file
     }
   } | tee $TMPDIR/push-failure
 
